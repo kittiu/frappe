@@ -7,7 +7,7 @@ import random
 import re
 import string
 import traceback
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from time import time
 
 from pypika.terms import Criterion, NullValue
@@ -17,6 +17,7 @@ import frappe.defaults
 import frappe.model.meta
 from frappe import _
 from frappe.database.utils import (
+	DefaultOrderBy,
 	EmptyQueryValues,
 	FallBackDateTimeStr,
 	LazyMogrify,
@@ -27,9 +28,9 @@ from frappe.database.utils import (
 from frappe.exceptions import DoesNotExistError, ImplicitCommitError
 from frappe.model.utils.link_count import flush_local_link_count
 from frappe.query_builder.functions import Count
-from frappe.query_builder.utils import DocType
 from frappe.utils import cast as cast_fieldtype
-from frappe.utils import get_datetime, get_table_name, getdate, now, sbool
+from frappe.utils import cint, get_datetime, get_table_name, getdate, now, sbool
+from frappe.utils.deprecations import deprecated, deprecation_warning
 
 IFNULL_PATTERN = re.compile(r"ifnull\(", flags=re.IGNORECASE)
 INDEX_PATTERN = re.compile(r"\s*\([^)]+\)\s*")
@@ -82,14 +83,12 @@ class Database:
 		ac_name=None,
 		use_default=0,
 		port=None,
-		read_only=False,
 	):
 		self.setup_type_map()
 		self.host = host or frappe.conf.db_host or "127.0.0.1"
 		self.port = port or frappe.conf.db_port or ""
 		self.user = user or frappe.conf.db_name
 		self.db_name = frappe.conf.db_name
-		self.read_only = read_only  # Uses READ ONLY connection if set
 		self._conn = None
 
 		if ac_name:
@@ -115,6 +114,17 @@ class Database:
 		self._conn = self.get_connection()
 		self._cursor = self._conn.cursor()
 		frappe.local.rollback_observers = []
+
+		try:
+			if execution_timeout := get_query_execution_timeout():
+				self.set_execution_timeout(execution_timeout)
+		except Exception as e:
+			frappe.logger("database").warning(f"Couldn't set execution timeout {e}")
+
+	def set_execution_timeout(self, seconds: int):
+		"""Set session speicifc timeout on exeuction of statements.
+		If any statement takes more time it will be killed along with entire transaction."""
+		raise NotImplementedError
 
 	def use(self, db_name):
 		"""`USE` db_name."""
@@ -209,13 +219,22 @@ class Database:
 			self._cursor.execute(query, values)
 		except Exception as e:
 			if self.is_syntax_error(e):
-				frappe.errprint(f"Syntax error in query:\n{query} {values}")
+				frappe.errprint(f"Syntax error in query:\n{query} {values or ''}")
 
 			elif self.is_deadlocked(e):
 				raise frappe.QueryDeadlockError(e) from e
 
 			elif self.is_timedout(e):
 				raise frappe.QueryTimeoutError(e) from e
+
+			elif self.is_read_only_mode_error(e):
+				frappe.throw(
+					_(
+						"Site is running in read only mode, this action can not be performed right now. Please try again later."
+					),
+					title=_("In Read Only Mode"),
+					exc=frappe.InReadOnlyMode,
+				)
 
 			# TODO: added temporarily
 			elif self.db_type == "postgres":
@@ -251,6 +270,11 @@ class Database:
 
 		if pluck:
 			return [r[0] for r in self.last_result]
+
+		if as_utf8:
+			deprecation_warning("as_utf8 parameter is deprecated and will be removed in version 15.")
+		if formatted:
+			deprecation_warning("formatted parameter is deprecated and will be removed in version 15.")
 
 		# scrub output if required
 		if as_dict:
@@ -370,10 +394,13 @@ class Database:
 	def fetch_as_dict(self, formatted=0, as_utf8=0) -> list[frappe._dict]:
 		"""Internal. Converts results to dict."""
 		result = self.last_result
-		ret = []
 		if result:
 			keys = [column[0] for column in self._cursor.description]
 
+		if not as_utf8:
+			return [frappe._dict(zip(keys, row)) for row in result]
+
+		ret = []
 		for r in result:
 			values = []
 			for value in r:
@@ -408,6 +435,9 @@ class Database:
 	@staticmethod
 	def convert_to_lists(res, formatted=0, as_utf8=0):
 		"""Convert tuple output to lists (internal)."""
+		if not as_utf8:
+			return [[value for value in row] for row in res]
+
 		nres = []
 		for r in res:
 			nr = []
@@ -430,7 +460,7 @@ class Database:
 		ignore=None,
 		as_dict=False,
 		debug=False,
-		order_by="KEEP_DEFAULT_ORDERING",
+		order_by=DefaultOrderBy,
 		cache=False,
 		for_update=False,
 		*,
@@ -500,7 +530,7 @@ class Database:
 		ignore=None,
 		as_dict=False,
 		debug=False,
-		order_by="KEEP_DEFAULT_ORDERING",
+		order_by=DefaultOrderBy,
 		update=None,
 		cache=False,
 		for_update=False,
@@ -559,7 +589,7 @@ class Database:
 			if (filters is not None) and (filters != doctype or doctype == "DocType"):
 				try:
 					if order_by:
-						order_by = "modified" if order_by == "KEEP_DEFAULT_ORDERING" else order_by
+						order_by = "modified" if order_by == DefaultOrderBy else order_by
 					out = self._get_values_from_table(
 						fields=fields,
 						filters=filters,
@@ -624,10 +654,10 @@ class Database:
 						return []
 
 			if as_dict:
-				return values and [values] or []
+				return [values] if values else []
 
 			if isinstance(fields, list):
-				return [map(values.get, fields)]
+				return [list(map(values.get, fields))]
 
 		else:
 			r = frappe.qb.engine.get_query(
@@ -790,7 +820,7 @@ class Database:
 		if fields == "*" and not isinstance(fields, (list, tuple)) and not isinstance(fields, Criterion):
 			as_dict = True
 
-		return self.sql(query, as_dict=as_dict, debug=debug, update=update, run=run, pluck=pluck)
+		return query.run(as_dict=as_dict, debug=debug, update=update, run=run, pluck=pluck)
 
 	def _get_value_for_many_names(
 		self,
@@ -821,6 +851,7 @@ class Database:
 			)
 		return {}
 
+	@deprecated
 	def update(self, *args, **kwargs):
 		"""Update multiple values. Alias for `set_value`."""
 		return self.set_value(*args, **kwargs)
@@ -850,10 +881,15 @@ class Database:
 		:param modified_by: Set this user as `modified_by`.
 		:param update_modified: default True. Set as false, if you don't want to update the timestamp.
 		:param debug: Print the query in the developer / js console.
-		:param for_update: Will add a row-level lock to the value that is being set so that it can be released on commit.
+		:param for_update: [DEPRECATED] This function now performs updates in single query, locking is not required.
 		"""
 		is_single_doctype = not (dn and dt != dn)
 		to_update = field if isinstance(field, dict) else {field: val}
+
+		if is_single_doctype:
+			deprecation_warning(
+				"Calling db.set_value to set single doctype values is deprecated. This behaviour will be removed in version 15. Use db.set_single_value instead."
+			)
 
 		if update_modified:
 			modified = modified or now()
@@ -872,19 +908,11 @@ class Database:
 			frappe.clear_document_cache(dt, dt)
 
 		else:
-			table = DocType(dt)
+			query = frappe.qb.engine.build_conditions(table=dt, filters=dn, update=True)
 
-			if for_update:
-				docnames = tuple(
-					self.get_values(dt, dn, "name", debug=debug, for_update=for_update, pluck=True)
-				) or (NullValue(),)
-				query = frappe.qb.update(table).where(table.name.isin(docnames))
-
-				for docname in docnames:
-					frappe.clear_document_cache(dt, docname)
-
+			if isinstance(dn, str):
+				frappe.clear_document_cache(dt, dn)
 			else:
-				query = frappe.qb.engine.build_conditions(table=dt, filters=dn, update=True)
 				# TODO: Fix this; doesn't work rn - gavin@frappe.io
 				# frappe.cache().hdel_keys(dt, "document_cache")
 				# Workaround: clear all document caches
@@ -899,10 +927,12 @@ class Database:
 			del self.value_cache[dt]
 
 	@staticmethod
+	@deprecated
 	def set(doc, field, val):
 		"""Set value in document. **Avoid**"""
 		doc.db_set(field, val)
 
+	@deprecated
 	def touch(self, doctype, docname):
 		"""Update the modified timestamp of this document."""
 		modified = now()
@@ -957,8 +987,10 @@ class Database:
 
 		return defaults.get(frappe.scrub(key))
 
-	def begin(self):
-		self.sql("START TRANSACTION")
+	def begin(self, *, read_only=False):
+		read_only = read_only or frappe.flags.read_only
+		mode = "READ ONLY" if read_only else ""
+		self.sql(f"START TRANSACTION {mode}")
 
 	def commit(self):
 		"""Commit current transaction. Calls SQL `COMMIT`."""
@@ -966,9 +998,7 @@ class Database:
 			frappe.call(method[0], *(method[1] or []), **(method[2] or {}))
 
 		self.sql("commit")
-		if self.db_type == "postgres":
-			# Postgres requires explicitly starting new transaction
-			self.begin()
+		self.begin()  # explicitly start a new transaction
 
 		frappe.local.rollback_observers = []
 		self.flush_realtime_log()
@@ -1009,6 +1039,9 @@ class Database:
 				if hasattr(obj, "on_rollback"):
 					obj.on_rollback()
 			frappe.local.rollback_observers = []
+
+			frappe.local.realtime_log = []
+			frappe.flags.enqueue_after_commit = []
 
 	def field_exists(self, dt, fn):
 		"""Return true of field exists."""
@@ -1072,7 +1105,7 @@ class Database:
 		query = frappe.qb.engine.get_query(
 			table=dt, filters=filters, fields=Count("*"), distinct=distinct
 		)
-		count = self.sql(query, debug=debug)[0][0]
+		count = query.run(debug=debug)[0][0]
 		if not filters and cache:
 			frappe.cache().set_value(f"doctype:count:{dt}", count, expires_in_sec=86400)
 		return count
@@ -1086,13 +1119,7 @@ class Database:
 		if not datetime:
 			return FallBackDateTimeStr
 
-		if isinstance(datetime, str):
-			if ":" not in datetime:
-				datetime = datetime + " 00:00:00.000000"
-		else:
-			datetime = datetime.strftime("%Y-%m-%d %H:%M:%S.%f")
-
-		return datetime
+		return get_datetime(datetime).strftime("%Y-%m-%d %H:%M:%S.%f")
 
 	def get_creation_count(self, doctype, minutes):
 		"""Get count of records created in the last x minutes"""
@@ -1226,6 +1253,7 @@ class Database:
 		"""
 		return self.sql_ddl(f"truncate `{get_table_name(doctype)}`")
 
+	@deprecated
 	def clear_table(self, doctype):
 		return self.truncate(doctype)
 
@@ -1300,12 +1328,24 @@ class Database:
 
 
 def enqueue_jobs_after_commit():
-	from frappe.utils.background_jobs import execute_job, get_queue
+	from frappe.utils.background_jobs import (
+		RQ_JOB_FAILURE_TTL,
+		RQ_RESULTS_TTL,
+		execute_job,
+		get_queue,
+	)
 
 	if frappe.flags.enqueue_after_commit and len(frappe.flags.enqueue_after_commit) > 0:
 		for job in frappe.flags.enqueue_after_commit:
 			q = get_queue(job.get("queue"), is_async=job.get("is_async"))
-			q.enqueue_call(execute_job, timeout=job.get("timeout"), kwargs=job.get("queue_args"))
+			q.enqueue_call(
+				execute_job,
+				timeout=job.get("timeout"),
+				kwargs=job.get("queue_args"),
+				failure_ttl=frappe.conf.get("rq_job_failure_ttl") or RQ_JOB_FAILURE_TTL,
+				result_ttl=frappe.conf.get("rq_results_ttl") or RQ_RESULTS_TTL,
+				job_id=job.get("job_id"),
+			)
 		frappe.flags.enqueue_after_commit = []
 
 
@@ -1333,3 +1373,28 @@ def savepoint(catch: type | tuple[type, ...] = Exception):
 		frappe.db.rollback(save_point=savepoint)
 	else:
 		frappe.db.release_savepoint(savepoint)
+
+
+def get_query_execution_timeout() -> int:
+	"""Get execution timeout based on current timeout in different contexts.
+
+	    HTTP requests: HTTP timeout or a default (300)
+	    Background jobs: Job timeout
+	Console/Commands: No timeout = 0.
+
+	    Note: Timeout adds 1.5x as "safety factor"
+	"""
+	from rq import get_current_job
+
+	if not frappe.conf.get("enable_db_statement_timeout"):
+		return 0
+
+	# Zero means no timeout, which is the default value in db.
+	timeout = 0
+	with suppress(Exception):
+		if getattr(frappe.local, "request", None):
+			timeout = frappe.conf.http_timeout or 300
+		elif job := get_current_job():
+			timeout = job.timeout
+
+	return int(cint(timeout) * 1.5)

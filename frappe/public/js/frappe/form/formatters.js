@@ -35,6 +35,7 @@ frappe.form.formatters = {
 	},
 	Data: function (value, df) {
 		if (df && df.options == "URL") {
+			if (!value) return;
 			return `<a href="${value}" title="Open Link" target="_blank">${value}</a>`;
 		}
 		value = value == null ? "" : value;
@@ -66,10 +67,9 @@ frappe.form.formatters = {
 				}
 			}
 
-			return frappe.form.formatters._right(
-				value == null || value === "" ? "" : format_number(value, null, precision),
-				options
-			);
+			value = value == null || value === "" ? "" : value;
+
+			return frappe.form.formatters._right(format_number(value, null, precision), options);
 		}
 	},
 	Int: function (value, docfield, options) {
@@ -121,7 +121,8 @@ frappe.form.formatters = {
 			}
 		}
 
-		value = value == null || value === "" ? "" : format_currency(value, currency, precision);
+		value = value == null || value === "" ? "" : value;
+		value = format_currency(value, currency, precision);
 
 		if (options && options.only_value) {
 			return value;
@@ -186,7 +187,7 @@ frappe.form.formatters = {
 			return value;
 		}
 		if (value) {
-			value = frappe.datetime.str_to_user(value);
+			value = frappe.datetime.str_to_user(value, false, true);
 			// handle invalid date
 			if (value === "Invalid date") {
 				value = null;
@@ -248,7 +249,7 @@ frappe.form.formatters = {
 			value = frappe.utils.get_formatted_duration(value, duration_options);
 		}
 
-		return value || "";
+		return value || "0s";
 	},
 	LikedBy: function (value) {
 		var html = "";

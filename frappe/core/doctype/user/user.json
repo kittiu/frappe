@@ -87,7 +87,8 @@
   "api_key",
   "generate_keys",
   "column_break_65",
-  "api_secret"
+  "api_secret",
+  "onboarding_status"
  ],
  "fields": [
   {
@@ -126,7 +127,7 @@
   {
    "fieldname": "middle_name",
    "fieldtype": "Data",
-   "label": "Middle Name (Optional)",
+   "label": "Middle Name",
    "oldfieldname": "middle_name",
    "oldfieldtype": "Data"
   },
@@ -492,7 +493,7 @@
   {
    "description": "Restrict user from this IP address only. Multiple IP addresses can be added by separating with commas. Also accepts partial IP addresses like (111.111.111)",
    "fieldname": "restrict_ip",
-   "fieldtype": "Data",
+   "fieldtype": "Small Text",
    "label": "Restrict IP",
    "permlevel": 1
   },
@@ -660,6 +661,13 @@
    "fieldname": "follow_assigned_documents",
    "fieldtype": "Check",
    "label": "Auto follow documents that are assigned to you"
+  },
+  {
+   "default": "{}",
+   "fieldname": "onboarding_status",
+   "fieldtype": "Small Text",
+   "hidden": 1,
+   "label": "Onboarding Status"
   }
  ],
  "icon": "fa fa-user",
@@ -722,7 +730,7 @@
    "link_fieldname": "user"
   }
  ],
- "modified": "2022-05-25 01:00:51.345319",
+ "modified": "2023-05-24 15:20:06.434506",
  "modified_by": "Administrator",
  "module": "Core",
  "name": "User",

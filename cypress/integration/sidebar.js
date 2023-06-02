@@ -4,9 +4,11 @@ const verify_attachment_visibility = (document, is_private) => {
 	const assertion = is_private ? "be.checked" : "not.be.checked";
 	cy.findByRole("button", { name: "Attach File" }).click();
 
-	cy.get_open_dialog().find(".file-upload-area").attachFile("sample_image.jpg", {
-		subjectType: "drag-n-drop",
-	});
+	cy.get_open_dialog()
+		.find(".file-upload-area")
+		.selectFile("cypress/fixtures/sample_image.jpg", {
+			action: "drag-drop",
+		});
 
 	cy.get_open_dialog().findByRole("checkbox", { name: "Private" }).should(assertion);
 };
@@ -36,11 +38,6 @@ context("Sidebar", () => {
 		//To check if no filter is available in "Assigned To" dropdown
 		cy.get(".empty-state").should("contain", "No filters found");
 
-		cy.click_sidebar_button("Created By");
-
-		//To check if "Created By" dropdown contains filter
-		cy.get(".group-by-item > .dropdown-item").should("contain", "Me");
-
 		//Assigning a doctype to a user
 		cy.visit("/app/doctype/ToDo");
 		cy.get(".form-assignments > .flex > .text-muted").click();
@@ -56,7 +53,7 @@ context("Sidebar", () => {
 		);
 
 		//To check if there is no filter added to the listview
-		cy.get(".filter-selector > .btn").should("contain", "Filter");
+		cy.get(".filter-button").should("contain", "Filter");
 
 		//To add a filter to display data into the listview
 		cy.get(".group-by-field.show > .dropdown-menu > .group-by-item > .dropdown-item").click();
@@ -70,7 +67,7 @@ context("Sidebar", () => {
 		cy.get(".condition").should("have.value", "like");
 		cy.get(".filter-field > .form-group > .input-with-feedback").should(
 			"have.value",
-			"%Administrator%"
+			`%${cy.config("testUser")}%`
 		);
 		cy.click_filter_button();
 
